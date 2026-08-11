@@ -58,8 +58,13 @@ local rowWidgets = {}
 local titleWidgets = nil
 local styleSource = nil
 local panelLayout = nil
--- Every widget this panel put into the host, so closing can take out exactly
--- what it added and nothing else.
+-- Primitive identity of the Start Menu that owns the cached panel. Widgets are
+-- reused only while this exact live menu remains the host; a replacement tree
+-- releases the cache instead of pinning objects from an old world.
+local cachedHostKey = nil
+-- Every widget this panel put into the host. Closing normally only collapses
+-- them so reopening the same Start Menu does not construct another full UMG
+-- subtree. Panel.release removes them when the host is replaced or invalid.
 local addedWidgets = {}
 -- The canvas the panel borrows is the menu's own SubMenu area, which the game
 -- keeps hidden until a submenu opens. Its visibility is forced on while the
@@ -164,6 +169,11 @@ end
 -- `icon` is this mod's own rail icon, used purely as a source of font and colour
 -- so no styling widget has to be created either.
 function Panel.attachTo(liveMenu, icon)
+    local nextHostKey = isValid(liveMenu) and objectName(liveMenu) or nil
+    if cachedHostKey ~= nil and cachedHostKey ~= nextHostKey
+        and type(Panel.release) == "function" then
+        Panel.release()
+    end
     host = liveMenu
     if isValid(icon) then
         local label = nil
@@ -546,8 +556,8 @@ local function resolvePanelLayout()
     return layout, nil
 end
 
--- Takes out only what the panel put in. The host belongs to the game, so
--- detaching it would tear the start menu down with it.
+-- Full cache release. Normal close does not call this: it only collapses the
+-- widgets. Release is for a replacement/invalid Start Menu or a broken cache.
 local function destroyPanel()
     for _, widget in ipairs(addedWidgets) do
         if isValid(widget) then pcall(function() widget:RemoveFromParent() end) end
@@ -558,19 +568,94 @@ local function destroyPanel()
     panelLayout = nil
     rowWidgets = {}
     titleWidgets = nil
+    cachedHostKey = nil
     if not isValid(host) then
         host = nil
         styleSource = nil
     end
 end
 
-local function buildPanel()
-    destroyPanel()
+local function hidePanel()
+    for _, widget in ipairs(addedWidgets) do
+        if isValid(widget) then
+            pcall(function() widget:SetVisibility(COLLAPSED) end)
+        end
+    end
+    restoreVisibilityChain()
+end
 
+local function panelCacheIsReusable()
+    if cachedHostKey == nil or not isValid(host)
+        or objectName(host) ~= cachedHostKey or not isValid(canvas)
+        or type(titleWidgets) ~= "table" or #rowWidgets ~= MAX_VISIBLE_ROWS
+        or #addedWidgets == 0 then
+        return false
+    end
+
+    local canvasKey = objectName(canvas)
+    for _, widget in ipairs(addedWidgets) do
+        if not isValid(widget) then return false end
+        local parent = nil
+        pcall(function() parent = widget.Slot.Parent end)
+        if not isValid(parent) or objectName(parent) ~= canvasKey then
+            return false
+        end
+    end
+    return true
+end
+
+local function sameLayout(left, right)
+    if left == nil or right == nil then return false end
+    return math.abs(left.canvasWidth - right.canvasWidth) < 0.01
+        and math.abs(left.canvasHeight - right.canvasHeight) < 0.01
+        and math.abs(left.panelWidth - right.panelWidth) < 0.01
+        and math.abs(left.panelHeight - right.panelHeight) < 0.01
+end
+
+local function reusePanelCache()
+    if not panelCacheIsReusable() then return false end
+
+    restoreVisibility = forceVisibleChain(canvas)
+    local measured, layoutError = resolvePanelLayout()
+    if measured == nil or not sameLayout(panelLayout, measured) then
+        restoreVisibilityChain()
+        if measured == nil then
+            log("cached panel layout unavailable: " .. tostring(layoutError))
+        else
+            log("cached panel layout changed; rebuilding widgets")
+        end
+        return false
+    end
+    panelLayout = measured
+
+    for _, widget in ipairs(addedWidgets) do
+        pcall(function()
+            widget:SetVisibility(VISIBLE)
+            widget:SetRenderOpacity(1.0)
+        end)
+    end
+    if titleWidgets ~= nil then
+        makeTextNonInteractive(titleWidgets.title)
+        makeTextNonInteractive(titleWidgets.footer)
+        makeTextNonInteractive(titleWidgets.closeText)
+    end
+    for _, widgets in ipairs(rowWidgets) do
+        makeTextNonInteractive(widgets.label)
+        makeTextNonInteractive(widgets.value)
+    end
+    log("reused cached panel widgets for " .. cachedHostKey)
+    return true
+end
+
+local function buildPanel()
     if not isValid(host) then
+        destroyPanel()
         log("cannot build panel: the start menu is not on screen")
         return false
     end
+
+    if reusePanelCache() then return true end
+    destroyPanel()
 
     -- The backing panel doubles as the probe that identifies a usable canvas,
     -- so the very first attachment is also the test.
@@ -724,6 +809,7 @@ local function buildPanel()
         }
     end
 
+    cachedHostKey = objectName(host)
     -- No AddToViewport: the host is the start menu, already on screen. The
     -- panel's widgets sit above it on Z order alone.
     log("panel built with " .. tostring(MAX_VISIBLE_ROWS) ..
@@ -1175,27 +1261,17 @@ function Panel.open()
     return true
 end
 
--- Closing always succeeds.
---
--- This used to return false without closing when the preview marker could not
--- be published, on the reasoning that a stuck marker is the more dangerous
--- state. It is not, and the reasoning does not survive contact with what
--- actually happens: refusing to close does not clear the marker either, so it
--- stays exactly as stuck -- and now the player is stuck with it, holding a
--- panel that swallows every button (handleButton consumes everything while
--- isOpen) over a start menu they can no longer use. Back does nothing, Escape
--- does nothing, and there is no mouse path out. That is the "I can use the
--- menu but I cannot close it" report.
---
--- It needed no exotic conditions. The marker was addressed to one named mod
--- that this menu does not require and does not ship with, so on any install
--- without that folder io.open failed and the very first Back press trapped the
--- player. The marker is now addressed only to a mod that asked for it, and
--- either way a marker is never worth the way out.
+-- Closing always succeeds. The widgets stay attached but collapsed while this
+-- exact Start Menu remains live, so repeated panel opens reuse one fixed UMG
+-- subtree instead of allocating another batch of widgets and slots each time.
 function Panel.close()
     setPreviewOwner(nil)
     isOpen = false
-    destroyPanel()
+    if isValid(host) then
+        hidePanel()
+    else
+        destroyPanel()
+    end
     expandedMod = nil
     selectionIndex = 1
     scrollOffset = 0
@@ -1204,6 +1280,20 @@ function Panel.close()
         styleSource = nil
     end
     return true
+end
+
+-- Releases every cached widget and host reference. The main module calls this
+-- when a newly constructed Start Menu supersedes the current widget tree; the
+-- next open will build exactly once for that new host.
+function Panel.release()
+    setPreviewOwner(nil)
+    isOpen = false
+    destroyPanel()
+    expandedMod = nil
+    selectionIndex = 1
+    scrollOffset = 0
+    host = nil
+    styleSource = nil
 end
 
 -- Dumps the host widget tree so the exact canvas/child names can be confirmed
@@ -1216,6 +1306,8 @@ function Panel.probe(emit)
 
     emit("controller: " .. objectName(resolveController()))
     emit("live host: " .. objectName(host))
+    emit(string.format("panel cache: host=%s widgets=%d",
+        tostring(cachedHostKey), #addedWidgets))
 
     if not isValid(host) then
         emit("probe stopped: open the start menu first, then run this again")
